@@ -117,6 +117,7 @@ class APIClient:
             provider=self.config.provider,
             model=self.config.model,
             no_tools=self.config.no_tools,
+            no_rag=self.config.no_rag,
             conversation_id=conversation_id,
             system_prompt=self.config.system_prompt,
             attachments=attachments,
@@ -205,7 +206,8 @@ class APIClient:
         if response.status_code != 200:
             error_msg = self._extract_error_message(response)
             raise httpx.HTTPStatusError(
-                message=f"Agent API error: {response.status_code} - {error_msg}",
+                message=f"Agent API error: {
+                    response.status_code} - {error_msg}",
                 request=response.request,
                 response=response,
             )

@@ -38,6 +38,9 @@ class APIRequest(BaseModel):
     provider: Optional[str] = Field(default=None, description="LLM provider")
     model: Optional[str] = Field(default=None, description="LLM model")
     no_tools: Optional[bool] = Field(default=None, description="Disable tool usage")
+    no_rag: Optional[bool] = Field(
+        default=None, description="Disable/Enable RAG/retrieval"
+    )
     conversation_id: Optional[str] = Field(
         default=None, description="Conversation ID for context"
     )
@@ -59,6 +62,7 @@ class APIRequest(BaseModel):
         provider = kwargs.get("provider")
         model = kwargs.get("model")
         no_tools = kwargs.get("no_tools")
+        no_rag = kwargs.get("no_rag")
         conversation_id = kwargs.get("conversation_id")
         system_prompt = kwargs.get("system_prompt")
         attachments = kwargs.get("attachments")
@@ -73,6 +77,7 @@ class APIRequest(BaseModel):
             provider=provider,
             model=model,
             no_tools=no_tools,
+            no_rag=no_rag,
             conversation_id=conversation_id,
             system_prompt=system_prompt,
             attachments=attachment_data,
@@ -116,7 +121,8 @@ class APIResponse(StreamingMetricsMixin):
         input_tokens = raw_data.get("input_tokens", 0)
         output_tokens = raw_data.get("output_tokens", 0)
 
-        # Extract streaming performance metrics (only available for streaming endpoint)
+        # Extract streaming performance metrics (only available for streaming
+        # endpoint)
         time_to_first_token = raw_data.get("time_to_first_token")
         streaming_duration = raw_data.get("streaming_duration")
         tokens_per_second = raw_data.get("tokens_per_second")
