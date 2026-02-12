@@ -762,3 +762,173 @@ class TestTokenTracker:
         tracker2.output_tokens = 100
         assert tracker1.get_counts() == (100, 50)
         assert tracker2.get_counts() == (200, 100)
+
+    def test_context_warning_when_zero_contexts_rag_enabled(
+        self,
+        config_loader: ConfigLoader,
+        mock_metric_manager: MetricManager,
+        mock_script_manager: ScriptExecutionManager,
+        mocker: MockerFixture,
+    ) -> None:
+        """Test context warning is created when RAG is enabled and contexts are zero."""
+        # Mock the handlers
+        mocker.patch("lightspeed_evaluation.pipeline.evaluation.evaluator.LLMManager")
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.EmbeddingManager"
+        )
+
+        mock_ragas = mocker.Mock()
+        mock_ragas.evaluate.return_value = (0.85, "Good faithfulness")
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.RagasMetrics",
+            return_value=mock_ragas,
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.DeepEvalMetrics"
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.CustomMetrics"
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.ScriptEvalMetrics"
+        )
+
+        # Configure RAG enabled (no_rag = False) and context_threshold = 1
+        config_loader.system_config.api.no_rag = False
+        config_loader.system_config.api.context_threshold = 1
+
+        evaluator = MetricsEvaluator(
+            config_loader, mock_metric_manager, mock_script_manager
+        )
+
+        # Create turn data with zero contexts (None = no contexts)
+        turn_data = TurnData(
+            turn_id="1",
+            query="What is Python?",
+            response="Python is a programming language.",
+            contexts=None,  # Zero contexts
+        )
+        conv_data = EvaluationData(conversation_group_id="test_conv", turns=[turn_data])
+
+        request = EvaluationRequest.for_turn(
+            conv_data, "ragas:faithfulness", 0, turn_data
+        )
+
+        result = evaluator.evaluate_metric(request)
+
+        assert result is not None
+        assert result.context_warning is not None
+        assert "Low context count (0/1)" in result.context_warning
+        assert "Potential for new content needs" in result.context_warning
+
+    def test_no_context_warning_when_rag_disabled(
+        self,
+        config_loader: ConfigLoader,
+        mock_metric_manager: MetricManager,
+        mock_script_manager: ScriptExecutionManager,
+        mocker: MockerFixture,
+    ) -> None:
+        """Test no context warning when RAG is disabled (no_rag mode)."""
+        # Mock the handlers
+        mocker.patch("lightspeed_evaluation.pipeline.evaluation.evaluator.LLMManager")
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.EmbeddingManager"
+        )
+
+        mock_ragas = mocker.Mock()
+        mock_ragas.evaluate.return_value = (0.85, "Good faithfulness")
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.RagasMetrics",
+            return_value=mock_ragas,
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.DeepEvalMetrics"
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.CustomMetrics"
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.ScriptEvalMetrics"
+        )
+
+        # Configure RAG disabled (no_rag = True)
+        config_loader.system_config.api.no_rag = True
+        config_loader.system_config.api.context_threshold = 1
+
+        evaluator = MetricsEvaluator(
+            config_loader, mock_metric_manager, mock_script_manager
+        )
+
+        # Create turn data with zero contexts (expected in no_rag mode)
+        turn_data = TurnData(
+            turn_id="1",
+            query="What is Python?",
+            response="Python is a programming language.",
+            contexts=None,  # Zero contexts (expected)
+        )
+        conv_data = EvaluationData(conversation_group_id="test_conv", turns=[turn_data])
+
+        request = EvaluationRequest.for_turn(
+            conv_data, "ragas:faithfulness", 0, turn_data
+        )
+
+        result = evaluator.evaluate_metric(request)
+
+        assert result is not None
+        assert result.context_warning is None  # No warning when RAG is disabled
+
+    def test_no_context_warning_above_threshold(
+        self,
+        config_loader: ConfigLoader,
+        mock_metric_manager: MetricManager,
+        mock_script_manager: ScriptExecutionManager,
+        mocker: MockerFixture,
+    ) -> None:
+        """Test no context warning when contexts are above threshold."""
+        # Mock the handlers
+        mocker.patch("lightspeed_evaluation.pipeline.evaluation.evaluator.LLMManager")
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.EmbeddingManager"
+        )
+
+        mock_ragas = mocker.Mock()
+        mock_ragas.evaluate.return_value = (0.85, "Good faithfulness")
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.RagasMetrics",
+            return_value=mock_ragas,
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.DeepEvalMetrics"
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.CustomMetrics"
+        )
+        mocker.patch(
+            "lightspeed_evaluation.pipeline.evaluation.evaluator.ScriptEvalMetrics"
+        )
+
+        # Configure RAG enabled and context_threshold = 2
+        config_loader.system_config.api.no_rag = False
+        config_loader.system_config.api.context_threshold = 2
+
+        evaluator = MetricsEvaluator(
+            config_loader, mock_metric_manager, mock_script_manager
+        )
+
+        # Create turn data with 3 contexts (above threshold of 2)
+        turn_data = TurnData(
+            turn_id="1",
+            query="What is Python?",
+            response="Python is a programming language.",
+            contexts=["Context 1", "Context 2", "Context 3"],  # 3 contexts
+        )
+        conv_data = EvaluationData(conversation_group_id="test_conv", turns=[turn_data])
+
+        request = EvaluationRequest.for_turn(
+            conv_data, "ragas:faithfulness", 0, turn_data
+        )
+
+        result = evaluator.evaluate_metric(request)
+
+        assert result is not None
+        assert result.context_warning is None  # No warning (3 >= 2)
