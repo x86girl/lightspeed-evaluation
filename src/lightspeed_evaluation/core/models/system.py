@@ -193,6 +193,12 @@ class APIConfig(BaseModel):
         description="Disable retrieval/RAG in API calls (for baseline experiments)",
     )
 
+    context_threshold: int = Field(
+        default=1,
+        ge=0,
+        description="Minimum number of contexts required. Flag when contexts < threshold.",
+    )
+
     @field_validator("endpoint_type")
     @classmethod
     def validate_endpoint_type(cls, v: str) -> str:

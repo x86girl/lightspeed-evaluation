@@ -500,6 +500,10 @@ class EvaluationResult(MetricResult, StreamingMetricsMixin):
         default=None,
         description="Additional metric metadata (JSON-encoded key-value pairs)",
     )
+    context_warning: Optional[str] = Field(
+        default=None,
+        description="Warning when contexts are below threshold (potential new content need)",
+    )
 
 
 class EvaluationScope(BaseModel):

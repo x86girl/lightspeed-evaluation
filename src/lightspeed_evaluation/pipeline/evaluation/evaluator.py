@@ -136,6 +136,29 @@ class MetricsEvaluator:
             execution_time = time.time() - start_time
 
             turn_data = request.turn_data
+
+            # Check context threshold and create warning if needed
+            context_warning = None
+            if turn_data:
+                # Count contexts
+                context_count = len(turn_data.contexts) if turn_data.contexts else 0
+
+                # Get threshold from config
+                context_threshold = (
+                    self.config_loader.system_config.api.context_threshold
+                )
+
+                # Check if RAG is enabled (only flag when RAG is active)
+                api_config = self.config_loader.system_config.api
+                is_rag_enabled = not (api_config.no_rag is True)
+
+                # Flag if RAG is enabled AND contexts are below threshold
+                if is_rag_enabled and context_count < context_threshold:
+                    context_warning = (
+                        f"Low context count ({context_count}/{context_threshold}). "
+                        f"Potential for new content needs."
+                    )
+
             return EvaluationResult(
                 **metric_result.model_dump(),
                 conversation_group_id=request.conv_data.conversation_group_id,
@@ -170,6 +193,7 @@ class MetricsEvaluator:
                     _to_json_str(turn_data.expected_tool_calls) if turn_data else None
                 ),
                 metrics_metadata=self._extract_metadata_for_csv(request),
+                context_warning=context_warning,
             )
 
         except Exception as e:  # pylint: disable=broad-exception-caught
