@@ -104,6 +104,7 @@ SUPPORTED_CSV_COLUMNS = [
     "expected_intent",
     "expected_keywords",
     "expected_tool_calls",
+    "context_warning",
 ]
 SUPPORTED_GRAPH_TYPES = [
     "pass_rates",

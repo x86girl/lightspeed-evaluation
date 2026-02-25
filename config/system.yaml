@@ -212,6 +212,7 @@ output:
     - "expected_intent"
     - "expected_keywords"
     - "expected_tool_calls"
+    - "context_warning"
   summary_config_sections:
       - llm           # Default
       - embedding     # Default
