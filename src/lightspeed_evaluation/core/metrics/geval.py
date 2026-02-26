@@ -1,17 +1,31 @@
 """GEval metrics handler using LLM Manager.
 
-This module provides integration with DeepEval's GEval for configurable custom evaluation criteria.
-GEval allows runtime-defined evaluation metrics through YAML configuration.
+This module provides integration with DeepEval's GEval for configurable custom
+evaluation criteria. This allows runtime-defined evaluation metrics through
+YAML configuration.
+
+- **criteria** / **evaluation_steps**: Define what and how to evaluate.
+  criteria is always required in the config.
+  evaluation_steps (if provided) are used as the steps the LLM follows; otherwise
+  GEval generates steps from criteria.
+- **rubrics**: Optional list of score ranges (0-10) with expected_outcome text.
+  Confines the judge's score output to those ranges. Works alongside
+  evaluation_steps: steps define how to evaluate, rubrics define score boundaries.
+- **Final score**: DeepEval normalizes GEval output to [0, 1].
 """
 
 import logging
 from typing import Any
 
 from deepeval.metrics import GEval
+from deepeval.metrics.g_eval import Rubric
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+
+from pydantic import ValidationError
 
 from lightspeed_evaluation.core.llm.deepeval import DeepEvalLLMManager
 from lightspeed_evaluation.core.metrics.manager import MetricLevel, MetricManager
+from lightspeed_evaluation.core.models import GEvalConfig
 
 logger = logging.getLogger(__name__)
 
@@ -85,34 +99,46 @@ class GEvalHandler:  # pylint: disable=R0903
         4. Delegate to `_evaluate_conversation()` or `_evaluate_turn()` depending
            on the `is_conversation` flag.
         """
-        # Extract GEval configuration from metadata
-        # May come from runtime metadata or a preloaded registry
-        geval_config = self._get_geval_config(
+        # Extract GEval configuration from metadata (runtime or system registry)
+        raw_config = self._get_geval_config(
             metric_name, conv_data, turn_data, is_conversation
         )
-
-        # If no configuration is available, return early with an informative message.
-        if not geval_config:
+        if not raw_config:
             return None, f"GEval configuration not found for metric '{metric_name}'"
 
-        # Extract configuration parameters
-        criteria = geval_config.get("criteria")
-        evaluation_params = geval_config.get("evaluation_params", [])
-        evaluation_steps = geval_config.get("evaluation_steps")
-        threshold = geval_config.get("threshold", 0.5)
+        # Load/validate GEval config from raw metadata: after override the dict may be
+        # system-only, level-only, or combined. We need a single validated
+        # GEvalConfig (criteria, rubrics, threshold, etc.) for evaluation.
+        try:
+            config = GEvalConfig.from_metadata(raw_config)
+        except (ValueError, ValidationError) as e:
+            return None, f"Invalid GEval configuration: {e!s}"
 
-        # The criteria field defines what the model is being judged on.
-        # Without it, we cannot perform evaluation. Evaluation steps can be generated
-        if not criteria:
-            return None, "GEval requires 'criteria' in configuration"
+        # Convert validated rubrics to DeepEval Rubric objects
+        rubrics: list[Rubric] | None = None
+        if config.rubrics:
+            rubrics = [
+                Rubric(score_range=r.score_range, expected_outcome=r.expected_outcome)
+                for r in config.rubrics
+            ]
 
         # Perform evaluation based on level (turn or conversation)
         if is_conversation:
             return self._evaluate_conversation(
-                conv_data, criteria, evaluation_params, evaluation_steps, threshold
+                conv_data,
+                config.criteria,
+                config.evaluation_params,
+                config.evaluation_steps,
+                config.threshold,
+                rubrics,
             )
         return self._evaluate_turn(
-            turn_data, criteria, evaluation_params, evaluation_steps, threshold
+            turn_data,
+            config.criteria,
+            config.evaluation_params,
+            config.evaluation_steps,
+            config.threshold,
+            rubrics,
         )
 
     def _convert_evaluation_params(
@@ -182,6 +208,7 @@ class GEvalHandler:  # pylint: disable=R0903
         evaluation_params: list[str],
         evaluation_steps: list[str] | None,
         threshold: float,
+        rubrics: list[Rubric] | None = None,
     ) -> tuple[float | None, str]:
         """Evaluate a single turn using GEval.
 
@@ -200,11 +227,14 @@ class GEvalHandler:  # pylint: disable=R0903
                 Optional step-by-step evaluation guidance for the model.
             threshold (float):
                 Minimum score threshold that determines pass/fail behavior.
+            rubrics (list[Rubric] | None):
+                Optional list of Rubric objects to confine score ranges (0-10).
+                Works alongside evaluation_steps; neither takes priority.
 
         Returns:
             tuple[float | None, str]:
-                A tuple of (score, reason). If evaluation fails, score will be None
-                and the reason will contain an error message.
+                A tuple of (score, reason). Score is in [0, 1] (per DeepEval).
+                If evaluation fails, score will be None and reason will hold an error.
         """
         # Validate that we actually have turn data
         if not turn_data:
@@ -239,6 +269,10 @@ class GEvalHandler:  # pylint: disable=R0903
         if evaluation_steps:
             metric_kwargs["evaluation_steps"] = evaluation_steps
 
+        # Add rubrics if provided (confine score ranges; works alongside criteria)
+        if rubrics:
+            metric_kwargs["rubric"] = rubrics
+
         # Instantiate the GEval metric object
         metric = GEval(**metric_kwargs)
 
@@ -258,7 +292,7 @@ class GEvalHandler:  # pylint: disable=R0903
         # Create test case for a single turn
         test_case = LLMTestCase(**test_case_kwargs)
 
-        # Evaluate
+        # Evaluate (DeepEval normalizes score to [0, 1]; pass through as-is)
         try:
             metric.measure(test_case)
             score = metric.score if metric.score is not None else 0.0
@@ -289,6 +323,7 @@ class GEvalHandler:  # pylint: disable=R0903
         evaluation_params: list[str],
         evaluation_steps: list[str] | None,
         threshold: float,
+        rubrics: list[Rubric] | None = None,
     ) -> tuple[float | None, str]:
         """Evaluate a conversation using GEval.
 
@@ -308,10 +343,13 @@ class GEvalHandler:  # pylint: disable=R0903
                 Optional instructions guiding how the evaluation should proceed.
             threshold (float):
                 Minimum acceptable score before the metric is considered failed.
+            rubrics (list[Rubric] | None):
+                Optional list of Rubric objects to confine score ranges (0-10).
+                Works alongside evaluation_steps.
 
         Returns:
             tuple[float | None, str]:
-                Tuple containing (score, reason). Returns None on error.
+                Tuple of (score, reason). Score is in [0, 1] (per DeepEval). None on error.
         """
         # Convert evaluation_params to enum values if valid, otherwise use defaults
         converted_params = self._convert_evaluation_params(evaluation_params)
@@ -339,6 +377,10 @@ class GEvalHandler:  # pylint: disable=R0903
         if evaluation_steps:
             metric_kwargs["evaluation_steps"] = evaluation_steps
 
+        # Add rubrics if provided (confine score ranges; works alongside criteria)
+        if rubrics:
+            metric_kwargs["rubric"] = rubrics
+
         # Instantiate the GEval metric object
         metric = GEval(**metric_kwargs)
 
@@ -357,7 +399,7 @@ class GEvalHandler:  # pylint: disable=R0903
             actual_output="\n".join(conversation_output),
         )
 
-        # Evaluate
+        # Evaluate (DeepEval normalizes score to [0, 1]; pass through as-is)
         try:
             metric.measure(test_case)
             score = metric.score if metric.score is not None else 0.0

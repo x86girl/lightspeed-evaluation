@@ -339,6 +339,9 @@ class TurnData(StreamingMetricsMixin):
                     "tool_name": tool_call["tool_name"],
                     "arguments": tool_call.get("arguments", {}),
                 }
+                # Preserve optional result field for result validation
+                if "result" in tool_call:
+                    validated_tool_call["result"] = tool_call["result"]
                 tool_calls.append(validated_tool_call)
 
             validated_sequences.append(tool_calls)
@@ -466,6 +469,10 @@ class EvaluationResult(MetricResult, StreamingMetricsMixin):
         ...,
         min_length=1,
         description="Metric identifier (e.g., 'ragas:response_relevancy')",
+    )
+    metric_metadata: Optional[str] = Field(
+        default=None,
+        description="Metric metadata for evaluation (JSON, excludes identifier and threshold)",
     )
     query: str = Field(default="", description="Query text")
     response: str = Field(default="", description="Response text")

@@ -3,8 +3,16 @@
 import os
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
+from lightspeed_evaluation.core.system.exceptions import ConfigurationError
 from lightspeed_evaluation.core.constants import (
     DEFAULT_API_BASE,
     DEFAULT_API_CACHE_DIR,
@@ -329,6 +337,404 @@ class CoreConfig(BaseModel):
     )
 
 
+class LLMParametersConfig(BaseModel):
+    """Dynamic parameters passed to LLM API calls.
+
+    These parameters are passed directly to the LLM provider.
+    All fields are optional - unset fields inherit from parent level.
+    Uses extra="allow" to pass through any provider-specific parameters.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    temperature: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature",
+    )
+    max_completion_tokens: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Maximum tokens in response",
+    )
+
+    def to_dict(self, exclude_none: bool = True) -> dict[str, Any]:
+        """Convert parameters to dict for passing to LLM.
+
+        Args:
+            exclude_none: If True, exclude None values from output
+
+        Returns:
+            Dict of parameters ready for LLM API call
+        """
+        params = self.model_dump()
+        if exclude_none:
+            return {k: v for k, v in params.items() if v is not None}
+        return params
+
+
+class LLMDefaultsConfig(BaseModel):
+    """Global default settings for all LLMs in the pool.
+
+    These are shared defaults that apply to all LLMs unless overridden
+    at the provider or model level.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cache_enabled: bool = Field(
+        default=True,
+        description="Is caching of LLM queries enabled?",
+    )
+    cache_dir: str = Field(
+        default=DEFAULT_LLM_CACHE_DIR,
+        min_length=1,
+        description="Base cache directory",
+    )
+
+    timeout: int = Field(
+        default=DEFAULT_API_TIMEOUT,
+        ge=1,
+        description="Request timeout in seconds",
+    )
+
+    num_retries: int = Field(
+        default=DEFAULT_LLM_RETRIES,
+        ge=0,
+        description="Retry attempts for failed requests",
+    )
+
+    # Default dynamic parameters
+    parameters: LLMParametersConfig = Field(
+        default_factory=lambda: LLMParametersConfig(
+            temperature=DEFAULT_LLM_TEMPERATURE,
+            max_completion_tokens=DEFAULT_LLM_MAX_TOKENS,
+        ),
+        description="Default dynamic parameters for LLM calls",
+    )
+
+
+class LLMProviderConfig(BaseModel):
+    """Configuration for a single LLM provider/model in the pool.
+
+    Contains model-specific settings. Cache and retry settings are managed
+    at the pool defaults level, not per-model.
+
+    The dict key is the unique model ID used for referencing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Required: Provider type
+    provider: str = Field(
+        min_length=1,
+        description="Provider type (e.g., openai, watsonx, gemini, hosted_vllm)",
+    )
+
+    # Model identity (optional - defaults to dict key)
+    model: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Actual model name. If not set, uses the dict key as model name.",
+    )
+
+    # SSL settings (optional - inherit from defaults or use system defaults)
+    ssl_verify: Optional[bool] = Field(
+        default=None,
+        description="Verify SSL certificates. Inherits from defaults if not set.",
+    )
+    ssl_cert_file: Optional[str] = Field(
+        default=None,
+        description="Path to custom CA certificate file",
+    )
+
+    # API endpoint/key configuration (optional - falls back to environment variable)
+    api_base: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Base URL for the API endpoint. "
+            "If not set, falls back to provider-specific environment variable."
+        ),
+    )
+    api_key_path: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Path to text file containing the API key for this model. "
+            "If not set, falls back to provider-specific environment variable."
+        ),
+    )
+
+    # Dynamic parameters (passed to LLM API)
+    parameters: LLMParametersConfig = Field(
+        default_factory=LLMParametersConfig,
+        description="Dynamic parameters for this model (merged with defaults)",
+    )
+
+    # Timeout can be model-specific (some models are slower)
+    timeout: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Override timeout for this model",
+    )
+
+
+class LLMPoolConfig(BaseModel):
+    """Pool of LLM configurations for reuse across the system.
+
+    Provides a centralized place to define all LLM configurations,
+    which can be referenced by judge_panel, agents, or other components.
+
+    Cache and retry settings are managed at the defaults level only.
+    Model entries contain model-specific settings (provider, parameters, SSL).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    defaults: LLMDefaultsConfig = Field(
+        default_factory=LLMDefaultsConfig,
+        description="Global default settings for all LLMs (cache, retry, parameters)",
+    )
+    models: dict[str, LLMProviderConfig] = Field(
+        default_factory=dict,
+        description="Model configurations. Key is unique model ID for referencing.",
+    )
+
+    def get_model_ids(self) -> list[str]:
+        """Get all available model IDs."""
+        return list(self.models.keys())
+
+    def resolve_llm_config(
+        self, model_id: str, cache_suffix: Optional[str] = None
+    ) -> LLMConfig:
+        """Resolve a model ID to a fully configured LLMConfig.
+
+        Resolution order: defaults -> model entry (for model-specific fields)
+
+        Args:
+            model_id: Model identifier (key in models dict)
+            cache_suffix: Optional suffix for cache directory (e.g., "judge_0")
+
+        Returns:
+            Fully resolved LLMConfig
+
+        Raises:
+            ValueError: If model_id not found
+        """
+        if model_id not in self.models:
+            raise ValueError(
+                f"Model '{model_id}' not found in llm_pool.models. "
+                f"Available: {list(self.models.keys())}"
+            )
+        entry = self.models[model_id]
+
+        # Merge parameters: defaults -> model entry
+        merged_params: dict[str, Any] = {}
+        merged_params.update(self.defaults.parameters.to_dict(exclude_none=True))
+        merged_params.update(entry.parameters.to_dict(exclude_none=True))
+
+        # Build cache_dir from defaults with model-specific suffix
+        suffix = cache_suffix if cache_suffix else model_id
+        cache_dir = os.path.join(self.defaults.cache_dir, suffix)
+
+        return LLMConfig(
+            provider=entry.provider,
+            model=entry.model or model_id,
+            temperature=merged_params.get("temperature", DEFAULT_LLM_TEMPERATURE),
+            max_tokens=merged_params.get(
+                "max_completion_tokens", DEFAULT_LLM_MAX_TOKENS
+            ),
+            timeout=(
+                entry.timeout if entry.timeout is not None else self.defaults.timeout
+            ),
+            num_retries=self.defaults.num_retries,
+            ssl_verify=(
+                entry.ssl_verify if entry.ssl_verify is not None else DEFAULT_SSL_VERIFY
+            ),
+            ssl_cert_file=entry.ssl_cert_file,
+            cache_enabled=self.defaults.cache_enabled,
+            cache_dir=cache_dir,
+            # Note: api_base and api_key_path are not propagated yet - requires LLMConfig extension
+        )
+
+
+class JudgePanelConfig(BaseModel):
+    """Judge panel configuration for multi-LLM evaluation.
+
+    References models from LLM pool by model ID (the key in llm_pool.models).
+    Each judge ID must correspond to a key in the llm_pool.models dictionary.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    judges: list[str] = Field(
+        ...,
+        min_length=1,
+        description="List of model IDs (keys from llm_pool.models). At least one required.",
+    )
+    enabled_metrics: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Metrics that should use the judge panel. "
+            "If None, all metrics use the panel. "
+            "If empty list, no metrics use the panel."
+        ),
+    )
+    aggregation_strategy: str = Field(
+        default="average",
+        description=(
+            "Strategy for aggregating scores from multiple judges. "
+            "Options: 'max', 'average', 'majority_vote'. "
+            "Note: Currently unused - will be implemented later."
+        ),
+    )
+
+    @field_validator("enabled_metrics")
+    @classmethod
+    def validate_enabled_metrics(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        """Validate enabled_metrics format (framework:metric_name)."""
+        if v is not None:
+            for metric in v:
+                if not metric or ":" not in metric:
+                    raise ValueError(
+                        f'Metric "{metric}" must be in format "framework:metric_name"'
+                    )
+                parts = metric.split(":", 1)
+                if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+                    raise ValueError(
+                        f'Metric "{metric}" must be in format "framework:metric_name"'
+                    )
+        return v
+
+    @field_validator("aggregation_strategy")
+    @classmethod
+    def validate_aggregation_strategy(cls, v: str) -> str:
+        """Validate aggregation_strategy is a supported value."""
+        allowed = ["max", "average", "majority_vote"]
+        if v not in allowed:
+            raise ValueError(
+                f"Unsupported aggregation_strategy '{v}'. Allowed: {allowed}"
+            )
+        return v
+
+
+class GEvalRubricConfig(BaseModel):
+    """Single rubric entry: score range 0-10 and expected outcome text."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score_range: tuple[int, int] = Field(
+        ...,
+        description="[min, max] score range (0-10); non-overlapping",
+    )
+    expected_outcome: str = Field(
+        ...,
+        min_length=1,
+        description="Expected outcome for this score range",
+    )
+
+    @field_validator("score_range")
+    @classmethod
+    def validate_score_range(cls, v: tuple[int, int]) -> tuple[int, int]:
+        """Ensure score_range is [min, max] with 0 <= min <= max <= 10."""
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            raise ValueError("score_range must be [min, max] with two integers")
+        low, high = int(v[0]), int(v[1])
+        if low > high:
+            raise ValueError(f"score_range min must be <= max, got [{low}, {high}]")
+        if not (0 <= low <= 10 and 0 <= high <= 10):
+            raise ValueError(
+                f"score_range values must be between 0 and 10, got [{low}, {high}]"
+            )
+        return (low, high)
+
+
+class GEvalConfig(BaseModel):
+    """Validated GEval metric configuration (criteria required; rest optional)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    criteria: str = Field(..., min_length=1, description="Required evaluation criteria")
+    evaluation_params: list[str] = Field(
+        default_factory=list,
+        description="Field names to include (e.g. query, response, expected_response)",
+    )
+    evaluation_steps: list[str] | None = Field(
+        default=None,
+        description="Optional step-by-step evaluation instructions",
+    )
+    rubrics: list[GEvalRubricConfig] | None = Field(
+        default=None,
+        description="Optional score ranges (0-10) with expected_outcome",
+    )
+    threshold: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Minimum score threshold for pass/fail",
+    )
+
+    @model_validator(mode="after")
+    def validate_rubrics_non_overlapping(self) -> "GEvalConfig":
+        """Ensure rubric score ranges do not overlap."""
+        rubs: list[GEvalRubricConfig] = self.rubrics if self.rubrics else []
+        if len(rubs) <= 1:
+            return self
+        ranges = [r.score_range for r in rubs]
+        for i, (a, b) in enumerate(ranges):
+            for j, (c, d) in enumerate(ranges):
+                if i >= j:
+                    continue
+                # Overlap if not (b < c or d < a)
+                if not (b < c or d < a):
+                    raise ValueError(
+                        f"Rubric score ranges must not overlap: "
+                        f"[{a}, {b}] and [{c}, {d}] overlap"
+                    )
+        return self
+
+    @classmethod
+    def from_metadata(cls, raw: dict[str, Any]) -> "GEvalConfig":
+        """Build GEvalConfig from raw metadata dict.
+
+        Args:
+            raw: Metadata dict with at least "criteria" (required). May include
+                evaluation_params, evaluation_steps, rubrics, threshold.
+
+        Returns:
+            Validated GEvalConfig instance.
+
+        Raises:
+            ValueError: If raw is not a dict or criteria is missing/empty
+                (only these pre-model_validate checks raise bare ValueError).
+            ValidationError: If rubric or config fields fail Pydantic validation:
+                wrong types (e.g. score_range, expected_outcome), invalid structure,
+                or overlapping score ranges (model validator raises ValueError
+                and Pydantic v2 wraps it as ValidationError).
+        """
+        if not isinstance(raw, dict):
+            raise ValueError("GEval config must be a dict")
+        criteria = raw.get("criteria")
+        if not criteria or not isinstance(criteria, str) or not criteria.strip():
+            raise ValueError("GEval requires non-empty 'criteria' in configuration")
+        data: dict[str, Any] = {
+            "criteria": criteria.strip(),
+            "evaluation_params": raw.get("evaluation_params") or [],
+            "evaluation_steps": raw.get("evaluation_steps"),
+            "threshold": raw.get("threshold", 0.5),
+        }
+        raw_rubrics = raw.get("rubrics")
+        if raw_rubrics and isinstance(raw_rubrics, list):
+            data["rubrics"] = [
+                GEvalRubricConfig.model_validate(item) for item in raw_rubrics
+            ]
+        else:
+            data["rubrics"] = None
+        return cls.model_validate(data)
+
+
 class SystemConfig(BaseModel):
     """System configuration using individual config models."""
 
@@ -339,6 +745,25 @@ class SystemConfig(BaseModel):
         default_factory=CoreConfig, description="Core eval configuration"
     )
     llm: LLMConfig = Field(default_factory=LLMConfig, description="LLM configuration")
+
+    # LLM Pool - shared pool of LLM configurations
+    llm_pool: Optional[LLMPoolConfig] = Field(
+        default=None,
+        description=(
+            "Pool of LLM configurations. Define models once, "
+            "reference by ID in judge_panel or other components."
+        ),
+    )
+
+    # Judge Panel - references models from llm_pool
+    judge_panel: Optional[JudgePanelConfig] = Field(
+        default=None,
+        description=(
+            "Optional judge panel configuration. "
+            "References models from 'llm_pool' by ID. "
+            "If not provided, the single 'llm' configuration is used."
+        ),
+    )
     embedding: EmbeddingConfig = Field(
         default_factory=EmbeddingConfig, description="Embeddings configuration"
     )
@@ -360,3 +785,83 @@ class SystemConfig(BaseModel):
     default_conversation_metrics_metadata: dict[str, dict[str, Any]] = Field(
         default_factory=dict, description="Default conversation metrics metadata"
     )
+
+    @field_validator(
+        "default_turn_metrics_metadata", "default_conversation_metrics_metadata"
+    )
+    @classmethod
+    def validate_default_metrics_metadata_geval(
+        cls, v: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """Validate GEval entries at load; keep storing as dict (result discarded).
+
+        We call GEvalConfig.from_metadata(meta) only for its validation side
+        effect (fail fast on invalid system config). The returned config is
+        discarded; the raw dict is stored. At evaluation time the manager
+        may merge overrides with this dict, and the handler re-validates
+        via from_metadata on the merged result.
+
+        Raises:
+            ConfigurationError: When a geval:* entry has invalid config (e.g.
+                missing criteria, invalid rubric structure).
+                Re-raised from ValueError or Pydantic ValidationError for a consistent
+                config-failure exception type.
+        """
+        if not v:
+            return v
+        for metric_id, meta in v.items():
+            if metric_id.startswith("geval:") and isinstance(meta, dict):
+                try:
+                    GEvalConfig.from_metadata(meta)
+                except (ValueError, ValidationError) as e:
+                    raise ConfigurationError(
+                        f"Invalid GEval config for '{metric_id}': {e!s}"
+                    ) from e
+        return v
+
+    def get_judge_configs(self) -> list[LLMConfig]:
+        """Get resolved LLMConfig for all judges.
+
+        Returns:
+            List of LLMConfig objects for each judge.
+            If judge_panel is configured, resolves from llm_pool.
+            Otherwise, returns single llm config.
+        """
+        if not self.judge_panel:
+            return [self.llm]
+
+        if not self.llm_pool:
+            raise ConfigurationError(
+                "judge_panel is configured but 'llm_pool' is not defined. "
+                "Please define the llm_pool section with models."
+            )
+
+        configs = []
+        for idx, judge_id in enumerate(self.judge_panel.judges):
+            cache_suffix = f"judge_{idx}"
+            config = self.llm_pool.resolve_llm_config(
+                judge_id, cache_suffix=cache_suffix
+            )
+            configs.append(config)
+        return configs
+
+    def get_llm_config(
+        self, model_id: str, cache_suffix: Optional[str] = None
+    ) -> LLMConfig:
+        """Get resolved LLMConfig for a specific model from the pool.
+
+        Args:
+            model_id: Model identifier (key in llm_pool.models)
+            cache_suffix: Optional suffix for cache directory
+
+        Returns:
+            Fully resolved LLMConfig
+
+        Raises:
+            ConfigurationError: If llm_pool not configured or model not found
+        """
+        if not self.llm_pool:
+            raise ConfigurationError(
+                f"Cannot resolve model '{model_id}' - 'llm_pool' is not configured."
+            )
+        return self.llm_pool.resolve_llm_config(model_id, cache_suffix=cache_suffix)
