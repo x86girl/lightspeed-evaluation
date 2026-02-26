@@ -143,14 +143,15 @@ class MetricsEvaluator:
                 # Count contexts
                 context_count = len(turn_data.contexts) if turn_data.contexts else 0
 
-                # Get threshold from config
+                # Get threshold from config (system_config is verified in __init__)
+                assert self.config_loader.system_config is not None
                 context_threshold = (
                     self.config_loader.system_config.api.context_threshold
                 )
 
                 # Check if RAG is enabled (only flag when RAG is active)
                 api_config = self.config_loader.system_config.api
-                is_rag_enabled = not (api_config.no_rag is True)
+                is_rag_enabled = api_config.no_rag is not True
 
                 # Flag if RAG is enabled AND contexts are below threshold
                 if is_rag_enabled and context_count < context_threshold:

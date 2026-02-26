@@ -944,6 +944,7 @@ class TestTokenTracker:
         )
 
         # Configure RAG enabled (no_rag = False) and context_threshold = 1
+        assert config_loader.system_config is not None
         config_loader.system_config.api.no_rag = False
         config_loader.system_config.api.context_threshold = 1
 
@@ -968,8 +969,9 @@ class TestTokenTracker:
 
         assert result is not None
         assert result.context_warning is not None
-        assert "Low context count (0/1)" in result.context_warning
-        assert "Potential for new content needs" in result.context_warning
+        assert isinstance(result.context_warning, str)
+        assert result.context_warning.find("Low context count (0/1)") != -1
+        assert result.context_warning.find("Potential for new content needs") != -1
 
     def test_no_context_warning_when_rag_disabled(
         self,
@@ -1002,6 +1004,7 @@ class TestTokenTracker:
         )
 
         # Configure RAG disabled (no_rag = True)
+        assert config_loader.system_config is not None
         config_loader.system_config.api.no_rag = True
         config_loader.system_config.api.context_threshold = 1
 
@@ -1058,6 +1061,7 @@ class TestTokenTracker:
         )
 
         # Configure RAG enabled and context_threshold = 2
+        assert config_loader.system_config is not None
         config_loader.system_config.api.no_rag = False
         config_loader.system_config.api.context_threshold = 2
 
